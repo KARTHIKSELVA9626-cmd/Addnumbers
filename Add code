@@ -1,0 +1,172 @@
+from __future__ import annotations
+from decimal import Decimal, getcontext, InvalidOperation
+from typing import Iterable, Iterator, List, Optional, Sequence, Union, AsyncIterable
+import logging
+import time
+import math
+
+# Optional imports for performance (install if needed)
+try:
+    import numpy as np
+except Exception:
+    np = None  # vectorized path disabled if numpy not available
+
+from concurrent.futures import ThreadPoolExecutor
+
+Number = Union[int, float, Decimal]
+
+logger = logging.getLogger("add_service")
+logger.setLevel(logging.INFO)  # or DEBUG in dev
+
+
+class AddServiceError(Exception):
+    """Base class for addition service errors."""
+
+
+class InvalidInputError(AddServiceError):
+    """Raised when inputs cannot be parsed as numbers."""
+
+
+class PrecisionError(AddServiceError):
+    """Raised when decimal arithmetic fails due to context limits."""
+
+
+def _to_decimal(x: Number) -> Decimal:
+    if isinstance(x, Decimal):
+        return x
+    if isinstance(x, (int,)):
+        return Decimal(x)
+    if isinstance(x, float):
+        # Convert float carefully to avoid binary->decimal surprises
+        return Decimal(str(x))
+    raise InvalidInputError(f"Unsupported numeric type: {type(x)!r}")
+
+
+def add_list_decimal(values: Sequence[Number], decimal_ctx_prec: Optional[int] = None) -> Decimal:
+  
+    if decimal_ctx_prec:
+        getcontext().prec = decimal_ctx_prec
+    total = Decimal(0)
+    try:
+        for v in values:
+            total += _to_decimal(v)
+    except InvalidInputError:
+        raise
+    except InvalidOperation as e:
+        raise PrecisionError("Decimal operation failed") from e
+    return total
+
+
+def add_list_fast(values: Sequence[Number]) -> Number:
+    
+    # Validate quickly: if all ints -> int sum; if floats present -> float sum
+    if not values:
+        return 0
+    has_float = any(isinstance(v, float) for v in values)
+    if has_float:
+        return sum(float(v) for v in values)
+    return sum(int(v) for v in values)
+
+
+def add_vectorized(values: Sequence[Number]) -> Number:
+    """
+    Use NumPy for very large arrays (must have numpy installed).
+    Faster for millions of elements; gives float64 results by default.
+    """
+    if np is None:
+        raise AddServiceError("NumPy not available; install numpy for vectorized summation.")
+    arr = np.asarray(values)
+    # Note: arr.sum() returns numpy scalar; cast to Python type
+    return arr.sum().item()
+
+
+def add_stream(iterator: Iterable[Number], batch_size: int = 10_000, use_decimal: bool = False) -> Number:
+    """
+    Stream-aware summation: consumes iterator in batches to keep memory bounded.
+    Good for very large or streaming inputs.
+    """
+    if use_decimal:
+        total = Decimal(0)
+        batch = []
+        for item in iterator:
+            try:
+                batch.append(_to_decimal(item))
+            except InvalidInputError as e:
+                logger.exception("Invalid input in stream")
+                raise
+            if len(batch) >= batch_size:
+                for b in batch:
+                    total += b
+                batch.clear()
+        # leftover
+        for b in batch:
+            total += b
+        return total
+    else:
+        total = 0
+        batch = []
+        for item in iterator:
+            if not isinstance(item, (int, float)):
+                raise InvalidInputError(f"Expected int/float, got {type(item)}")
+            total += item
+        return total
+
+
+# Example: concurrency wrapper for CPU-bound large chunks
+def add_in_parallel(chunks: Sequence[Sequence[Number]], max_workers: int = 4, use_decimal: bool = False) -> Number:
+    """
+    Sum multiple chunks in parallel, then reduce. Useful for sharded data.
+    Choice of Thread vs Process depends on workload and GIL considerations.
+    """
+    def worker(chunk):
+        return add_list_decimal(chunk) if use_decimal else add_list_fast(chunk)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        partials = list(exe.map(worker, chunks))
+    # Final reduce (do in Decimal if decimals returned)
+    if use_decimal:
+        total = Decimal(0)
+        for p in partials:
+            total += p
+        return total
+    return sum(partials)
+
+
+# Async example for async iterators
+async def add_async_stream(aiter: AsyncIterable[Number], use_decimal: bool = False) -> Number:
+    total = Decimal(0) if use_decimal else 0
+    async for v in aiter:
+        if use_decimal:
+            total += _to_decimal(v)
+        else:
+            if not isinstance(v, (int, float)):
+                raise InvalidInputError(f"Expected int/float in async stream, got {type(v)}")
+            total += v
+    return total
+
+
+# Simple sanity-check utilities / small benchmarks for performance guidance
+def quick_benchmark(n: int = 1_000_000):
+    import random, time
+    data = [random.random() for _ in range(n)]
+    t0 = time.time()
+    s_fast = add_list_fast(data)
+    t1 = time.time()
+    s_vec = None
+    if np is not None:
+        t2 = time.time()
+        s_vec = add_vectorized(data)
+        t3 = time.time()
+        logger.info("fast: %.3fs, vectorized: %.3fs", t1 - t0, t3 - t2)
+    else:
+        logger.info("fast: %.3fs (numpy not available)", t1 - t0)
+    return {"fast": (s_fast, t1 - t0), "vectorized": (s_vec, (t3 - t2) if np is not None else None)}
+
+
+# Example usage
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    print("Decimal sum:", add_list_decimal([1.1, 2.2, 3.3], decimal_ctx_prec=28))
+    print("Fast sum:", add_list_fast([1, 2, 3, 4]))
+    if np:
+        print("Vectorized sum:", add_vectorized([1, 2, 3, 4]))      
